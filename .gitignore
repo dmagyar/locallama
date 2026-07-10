@@ -1,0 +1,60 @@
+# Build artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+compile_commands.json
+llama-config.cmake
+llama.pc
+llama-version.cmake
+Makefile
+Testing/
+Release/
+host-toolchain.cmake
+
+# Compiled binaries and libraries
+*.a
+*.so
+*.dll
+*.exe
+*.lib
+*.pdb
+
+# Build directories
+build/
+dist/
+
+# Launcher embedded server binaries (built separately)
+launcher/servers/windows/
+launcher/servers/linux/
+
+# Launcher build dependencies (cloned repos + build output)
+launcher/llama-src/
+launcher/llama-build/
+
+# OpenVINO / oneAPI redistributables
+openvino.tgz
+*.tgz
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Go
+*.out
+
+# Claude
+.claude/

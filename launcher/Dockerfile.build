@@ -1,0 +1,68 @@
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build git curl wget python3 pkg-config \
+    libvulkan-dev vulkan-utility-libraries-dev \
+    opencl-headers ocl-icd-opencl-dev ocl-icd-libopencl1 \
+    mingw-w64 xz-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# OpenVINO (for NPU support — optional, works without it)
+ARG OPENVINO_VERSION_MAJOR=2026.2
+ARG OPENVINO_VERSION_FULL=2026.2.0.21903.52ddc073857
+RUN curl -fSL -o /tmp/openvino.tgz \
+    "https://storage.openvinotoolkit.org/repositories/openvino/packages/${OPENVINO_VERSION_MAJOR}/linux/openvino_toolkit_ubuntu24_${OPENVINO_VERSION_FULL}_x86_64.tgz" && \
+    mkdir -p /opt/intel/openvino_${OPENVINO_VERSION_MAJOR} && \
+    tar xzf /tmp/openvino.tgz -C /opt/intel/openvino_${OPENVINO_VERSION_MAJOR} --strip-components=1 && \
+    ln -sfn /opt/intel/openvino_${OPENVINO_VERSION_MAJOR} /opt/intel/openvino && \
+    rm /tmp/openvino.tgz
+
+ENV OPENVINO_ROOT=/opt/intel/openvino
+ENV OpenVINO_DIR=/opt/intel/openvino/runtime/cmake
+
+WORKDIR /app
+COPY . .
+
+# Build llama.cpp with Vulkan + OpenVINO
+RUN cd launcher/llama-src && \
+    mkdir -p build-npu && cd build-npu && \
+    cmake .. -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_VULKAN=ON \
+        -DGGML_OPENVINO=ON \
+        -DGGML_CPU=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DLLAMA_SERVER=ON \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DOpenVINO_DIR=${OpenVINO_DIR} && \
+    ninja llama-server -j$(nproc)
+
+RUN cp launcher/llama-src/build-npu/bin/llama-server launcher/servers/linux/llama-server
+
+WORKDIR /app/launcher
+
+# Embedded Linux builds
+RUN bash build-local.sh linux ../build/gemma-2-2b-it-Q4_K_M.gguf "" "gemma-2-2b-it" "Gemma_2_2B_IT_Q4_K_M" && \
+    bash build-local.sh linux ../build/gemma-4-E2B-it-qat-Q4_0.gguf -g4 "gemma-4-E2B-it" "Gemma_4_E2B_IT_QAT_Q4_0"
+
+# Slim Windows builds (no model embedded — download or sidecar)
+ARG G2_URL=""
+ARG G4_URL=""
+RUN bash build-local.sh windows "" -g2 "gemma-2-2b-it" "Gemma_2_2B_IT_Q4_K_M" "${G2_URL}" && \
+    bash build-local.sh windows "" -g4 "gemma-4-E2B-it" "Gemma_4_E2B_IT_QAT_Q4_0" "${G4_URL}"
+
+# Final image
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ocl-icd-libopencl1 libvulkan1 mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/build/ollama-local-linux /usr/local/bin/ollama-local
+COPY --from=builder /app/build/ollama-local-g4-linux /usr/local/bin/ollama-local-g4
+COPY --from=builder /app/build/ollama-local-g2-windows.exe /out/ollama-local-g2-windows.exe
+COPY --from=builder /app/build/ollama-local-g4-windows.exe /out/ollama-local-g4-windows.exe
+
+ENTRYPOINT ["/usr/local/bin/ollama-local"]
