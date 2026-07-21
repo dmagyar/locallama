@@ -59,6 +59,7 @@ __pycache__/
 # Prism llama.cpp fork (clone + build)
 prism-llama/
 prism-build/
+cross-build/
 
 # Claude
 .claude/

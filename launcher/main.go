@@ -294,46 +294,6 @@ type modelSource struct {
 	sizeMB  float64
 }
 
-// extractEmbeddedModel copies the embedded model data from the executable to a temp file.
-// Uses io.Copy for efficient streaming (no full model loaded into RAM).
-func extractEmbeddedModel(exePath string, toc *tocResult) (string, error) {
-	exe, err := os.Open(exePath)
-	if err != nil {
-		return "", fmt.Errorf("open executable: %w", err)
-	}
-	defer exe.Close()
-
-	// Create temp file in system temp dir (avoid /dev/shm — often too small for large models)
-	tmpFile, err := os.CreateTemp("", "ollama-model-*.gguf")
-	if err != nil {
-		return "", fmt.Errorf("create temp model: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-
-	// Seek to model data in executable and stream to temp file
-	exe.Seek(toc.modelOffset, 0)
-	written, err := io.Copy(tmpFile, io.LimitReader(exe, toc.modelSize))
-	tmpFile.Close()
-	if err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("copy model data: %w", err)
-	}
-	if written != toc.modelSize {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("incomplete extraction: wrote %d of %d bytes", written, toc.modelSize)
-	}
-
-	// Clean up temp model file when process exits
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		<-sigCh
-		os.Remove(tmpPath)
-	}()
-
-	return tmpPath, nil
-}
-
 // resolveModel finds the model via: sidecar .gguf → embedded → prompt + download
 func resolveModel(exePath string) (*modelSource, error) {
 	exeDir := filepath.Dir(exePath)
@@ -354,13 +314,7 @@ func resolveModel(exePath string) (*modelSource, error) {
 	toc, err := findModelInExe()
 	if err == nil {
 		log.Printf("Found embedded model: %.1f MB at offset %d", float64(toc.modelSize)/1024/1024, toc.modelOffset)
-		// Extract embedded model to temp file (llama-server needs a real file path)
-		tmpModel, extractErr := extractEmbeddedModel(exePath, toc)
-		if extractErr != nil {
-			return nil, fmt.Errorf("extract embedded model: %w", extractErr)
-		}
-		log.Printf("Extracted embedded model to: %s", tmpModel)
-		return &modelSource{path: tmpModel, method: "embedded", sizeMB: float64(toc.modelSize) / 1024 / 1024}, nil
+		return &modelSource{toc: toc, method: "embedded", sizeMB: float64(toc.modelSize) / 1024 / 1024}, nil
 	}
 
 	// 3. No model found — prompt to download if URL is configured

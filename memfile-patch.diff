@@ -1,0 +1,178 @@
+diff --git a/src/llama.cpp b/src/llama.cpp
+index a67fa80..f279078 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -23,9 +23,20 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <ctime>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <vector>
+ 
++// ─── memfile:// protocol: load model from memory-mapped executable region ───
++// Env vars: OLLAMA_EXE_PATH, OLLAMA_MODEL_OFFSET, OLLAMA_MODEL_SIZE
++#if defined(_WIN32)
++#include <windows.h>
++#else
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
+ #if defined(_MSC_VER)
+ #pragma warning(disable: 4244 4267) // possible loss of data
+ #endif
+@@ -416,6 +427,141 @@ struct llama_model * llama_model_init_from_user(
+     params.use_extra_bufts = false;
+     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
+ }
++
++// ─── memfile:// protocol implementation ──────────────────────────────────────
++// Load a GGUF model from a memory-mapped region of an executable binary.
++// Environment variables:
++//   OLLAMA_EXE_PATH      – path to the executable containing the embedded model
++//   OLLAMA_MODEL_OFFSET  – byte offset of model data within the executable
++//   OLLAMA_MODEL_SIZE    – size of model data in bytes
++//
++// The mapped region remains valid for the lifetime of the process; the OS
++// reclaims it on exit. No copy or allocation of model data occurs.
++
++#if defined(_WIN32)
++static void * memfile_map(const char * path, size_t offset, size_t size) {
++    // Convert UTF-8 path to wide string for Windows API
++    int len = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
++    if (len <= 0) return nullptr;
++    std::vector<wchar_t> wpath(len);
++    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), len);
++
++    HANDLE hFile = CreateFileW(wpath.data(), GENERIC_READ,
++                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
++                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (hFile == INVALID_HANDLE_VALUE) return nullptr;
++
++    // Create a file mapping object
++    DWORD high = (DWORD)((offset + size) >> 32);
++    HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, high,
++                                     (DWORD)offset, nullptr);
++    CloseHandle(hFile);
++    if (!hMap) return nullptr;
++
++    // Map the view at the desired offset
++    DWORD offHigh = (DWORD)(offset >> 32);
++    void * ptr = MapViewOfFile(hMap, FILE_MAP_READ, offHigh, (DWORD)offset, size);
++    CloseHandle(hMap);
++    return ptr;
++}
++static void memfile_unmap(void * ptr, size_t) {
++    if (ptr) UnmapViewOfFile(ptr);
++}
++#else
++static void * memfile_map(const char * path, size_t offset, size_t size) {
++    int fd = open(path, O_RDONLY);
++    if (fd < 0) return nullptr;
++    void * ptr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, (off_t)offset);
++    close(fd);
++    return (ptr == MAP_FAILED) ? nullptr : ptr;
++}
++static void memfile_unmap(void * ptr, size_t size) {
++    if (ptr) munmap(ptr, size);
++}
++#endif
++
++// Context struct for memfile tensor data callback.
++// Holds both the base pointer (mapped region) and the GGUF context.
++struct memfile_cb_ctx {
++    const uint8_t * base;
++    struct gguf_context * gguf;
++};
++
++// Tensor data callback: point each tensor directly at the mapped region.
++static void memfile_set_tensor_cb(struct ggml_tensor * tensor, void * userdata) {
++    memfile_cb_ctx * c = static_cast<memfile_cb_ctx *>(userdata);
++    const char * tname = ggml_get_name(tensor);
++    int64_t tid = gguf_find_tensor(c->gguf, tname);
++    if (tid < 0) return; // derived/computed tensor, skip
++    size_t data_off = gguf_get_data_offset(c->gguf);
++    size_t t_off = gguf_get_tensor_offset(c->gguf, tid);
++    tensor->data = const_cast<void *>(
++        static_cast<const void *>(c->base + data_off + t_off));
++}
++
++static struct llama_model * llama_model_load_from_memfile(struct llama_model_params params) {
++    const char * exe_path_env = getenv("OLLAMA_EXE_PATH");
++    const char * offset_env   = getenv("OLLAMA_MODEL_OFFSET");
++    const char * size_env     = getenv("OLLAMA_MODEL_SIZE");
++    if (!exe_path_env || !offset_env || !size_env) {
++        LLAMA_LOG_ERROR("%s: OLLAMA_EXE_PATH, OLLAMA_MODEL_OFFSET, and OLLAMA_MODEL_SIZE must be set\n", __func__);
++        return nullptr;
++    }
++
++    std::string exe_path(exe_path_env);
++    size_t offset = (size_t)strtoull(offset_env, nullptr, 0);
++    size_t size   = (size_t)strtoull(size_env, nullptr, 0);
++    if (!size) {
++        LLAMA_LOG_ERROR("%s: OLLAMA_MODEL_SIZE must be non-zero\n", __func__);
++        return nullptr;
++    }
++
++    LLAMA_LOG_INFO("%s: mapping %zu bytes at offset %zu from '%s'\n",
++                   __func__, size, offset, exe_path.c_str());
++
++    // Memory-map the model region from the executable
++    void * mapped = memfile_map(exe_path.c_str(), offset, size);
++    if (!mapped) {
++        LLAMA_LOG_ERROR("%s: failed to memory-map model region\n", __func__);
++        return nullptr;
++    }
++
++    // Parse GGUF metadata from the mapped buffer
++    struct ggml_context * ctx = nullptr;
++    struct gguf_init_params gguf_params = { true, &ctx }; // no_alloc = true
++    struct gguf_context * gguf_ctx = gguf_init_from_buffer(mapped, size, gguf_params);
++    if (!gguf_ctx) {
++        LLAMA_LOG_ERROR("%s: failed to parse GGUF from mapped buffer\n", __func__);
++        memfile_unmap(mapped, size);
++        return nullptr;
++    }
++
++    // Pack base pointer + GGUF context for the tensor data callback
++    memfile_cb_ctx cb_ctx{ static_cast<const uint8_t *>(mapped), gguf_ctx };
++
++    // Build model params: inherit caller's device selection, disable mmap
++    llama_model_params mparams = llama_model_default_params();
++    mparams.devices                   = params.devices;
++    mparams.main_gpu                  = params.main_gpu;
++    mparams.progress_callback         = params.progress_callback;
++    mparams.progress_callback_user_data = params.progress_callback_user_data;
++    mparams.vocab_only                = params.vocab_only;
++    mparams.no_alloc                  = params.no_alloc;
++    mparams.check_tensors             = params.check_tensors;
++    mparams.kv_overrides              = params.kv_overrides;
++    mparams.tensor_buft_overrides     = params.tensor_buft_overrides;
++    mparams.use_mmap                  = false;  // data already in memory
++
++    struct llama_model * model = llama_model_init_from_user(
++        gguf_ctx, memfile_set_tensor_cb, &cb_ctx, mparams);
++
++    if (!model) {
++        memfile_unmap(mapped, size);
++    }
++    // NOTE: mapped region lives for the process lifetime; OS reclaims on exit.
++    return model;
++}
++
+ // deprecated
+ struct llama_model * llama_load_model_from_file(
+         const char * path_model,
+@@ -426,6 +572,10 @@ struct llama_model * llama_load_model_from_file(
+ struct llama_model * llama_model_load_from_file(
+         const char * path_model,
+         struct llama_model_params params) {
++    // Intercept memfile:// protocol — load model from memory-mapped exe region
++    if (path_model && std::strncmp(path_model, "memfile://", 10) == 0) {
++        return llama_model_load_from_memfile(params);
++    }
+     std::vector<std::string> splits = {};
+     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
+ }
