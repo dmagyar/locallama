@@ -56,5 +56,9 @@ __pycache__/
 # Go
 *.out
 
+# Prism llama.cpp fork (clone + build)
+prism-llama/
+prism-build/
+
 # Claude
 .claude/
